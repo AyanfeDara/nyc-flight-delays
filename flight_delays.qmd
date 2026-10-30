@@ -1,0 +1,226 @@
+---
+title: "NYC flight delays: time of day matters more than the weather"
+author: "Olorunmaiye Peter"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: true
+    theme: flatly
+execute:
+  warning: false
+  message: false
+---
+
+## Business question
+
+Late departures cost airlines crew time, missed connections and unhappy passengers. **Which flights leaving New York leave late, and how much of that is down to the weather rather than things the airline controls, like the time of day a flight is scheduled?**
+
+**Data:** every flight that left JFK, LaGuardia and Newark in 2023 (U.S. Bureau of Transportation Statistics), with hourly weather at each airport (Iowa Environmental Mesonet), from the `nycflights23` R package.
+
+A flight counts as **late** if it left 15 minutes or more after its scheduled time, the standard used by the U.S. Department of Transportation.
+
+## 1. Setup
+
+```{r setup}
+library(tidyverse)     # dplyr, ggplot2, forcats, tidyr
+library(nycflights23)  # flights, weather, airlines
+library(broom)         # tidy model output
+
+dir.create("charts", showWarnings = FALSE)
+
+orange <- "#e8603c"
+navy   <- "#13263f"
+grey   <- "#c9ced6"
+theme_set(theme_minimal(base_size = 12))
+```
+
+## 2. Load and check the data
+
+```{r load}
+cat("Flights:", nrow(flights), " Weather hours:", nrow(weather),
+    " Airlines:", nrow(airlines), "\n")
+
+# A flight with no departure time never left: it was cancelled
+summary_counts <- flights |>
+  summarise(flights   = n(),
+            cancelled = sum(is.na(dep_time)),
+            pct_cancelled = round(100 * cancelled / flights, 1))
+summary_counts
+
+# Keep flights that left, and mark the late ones
+departed <- flights |>
+  filter(!is.na(dep_delay)) |>
+  left_join(airlines, by = "carrier") |>
+  rename(airline = name) |>
+  mutate(late = dep_delay >= 15)
+
+departed |>
+  summarise(departed = n(),
+            pct_late = round(100 * mean(late), 1),
+            avg_delay_mins = round(mean(dep_delay), 1),
+            median_delay_mins = median(dep_delay))
+```
+
+**Check:** 435,352 flights, 10,738 cancelled (2.5%); of the 424,614 that left, 21.6% were late. The median delay is negative: most flights leave a little early.
+
+## 3. When are flights late?
+
+### Delays build up through the day
+
+```{r by-hour, fig.width = 9, fig.height = 5}
+by_hour <- departed |>
+  group_by(hour) |>
+  summarise(flights = n(), pct_late = 100 * mean(late)) |>
+  filter(flights >= 1000)          # leaves out hours with very few flights
+by_hour |> mutate(pct_late = round(pct_late, 1)) |> print(n = Inf)
+
+p_hour <- ggplot(by_hour, aes(x = hour, y = pct_late)) +
+  geom_col(fill = orange, width = 0.75) +
+  geom_text(aes(label = round(pct_late)), vjust = -0.4, size = 3.4) +
+  scale_x_continuous(breaks = 5:22, labels = \(h) paste0(h, ":00")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "The later in the day a flight is scheduled, the more likely it leaves late",
+       subtitle = "Share of departures 15+ minutes late, by scheduled hour, NYC airports 2023",
+       x = "Scheduled departure", y = "Late (%)",
+       caption = "Source: U.S. Bureau of Transportation Statistics via nycflights23") +
+  theme(panel.grid.major.x = element_blank())
+p_hour
+ggsave("charts/late_by_hour.png", p_hour, width = 9, height = 5, dpi = 150, bg = "white")
+```
+
+### Airlines and airports
+
+```{r by-airline, fig.width = 9, fig.height = 5}
+by_airline <- departed |>
+  group_by(airline) |>
+  summarise(flights = n(), pct_late = 100 * mean(late)) |>
+  filter(flights >= 5000) |>
+  arrange(pct_late)
+by_airline |> mutate(pct_late = round(pct_late, 1))
+
+p_airline <- ggplot(by_airline, aes(x = pct_late, y = reorder(airline, pct_late))) +
+  geom_col(fill = navy, width = 0.65) +
+  geom_text(aes(label = paste0(round(pct_late, 1), "%")), hjust = -0.15, size = 3.4) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Share of departures 15+ minutes late, by airline",
+       subtitle = "Airlines with at least 5,000 departures from NYC in 2023",
+       x = "Late (%)", y = NULL,
+       caption = "Source: U.S. Bureau of Transportation Statistics via nycflights23")
+p_airline
+ggsave("charts/late_by_airline.png", p_airline, width = 9, height = 5, dpi = 150, bg = "white")
+
+departed |>
+  group_by(origin) |>
+  summarise(flights = n(), pct_late = round(100 * mean(late), 1))
+```
+
+## 4. How much does the weather matter?
+
+Each flight is matched to the weather at its airport in the hour it was scheduled to leave.
+
+```{r weather}
+with_weather <- departed |>
+  inner_join(weather |> select(origin, time_hour, precip, visib, wind_speed),
+             by = c("origin", "time_hour")) |>
+  drop_na(precip, visib, wind_speed) |>
+  mutate(rain        = precip > 0,
+         low_vis     = visib < 3,          # under 3 miles of visibility
+         strong_wind = wind_speed >= 20)   # 20 mph or more
+
+cat("Flights matched to weather:", nrow(with_weather), "\n")
+
+weather_effect <- bind_rows(
+  with_weather |> group_by(condition = if_else(rain, "Yes", "No")) |>
+    summarise(flights = n(), pct_late = 100 * mean(late)) |> mutate(factor = "Rain"),
+  with_weather |> group_by(condition = if_else(low_vis, "Yes", "No")) |>
+    summarise(flights = n(), pct_late = 100 * mean(late)) |> mutate(factor = "Visibility under 3 miles"),
+  with_weather |> group_by(condition = if_else(strong_wind, "Yes", "No")) |>
+    summarise(flights = n(), pct_late = 100 * mean(late)) |> mutate(factor = "Wind 20 mph or more")
+)
+weather_effect |> mutate(pct_late = round(pct_late, 1))
+
+p_weather <- ggplot(weather_effect, aes(x = pct_late, y = factor, fill = condition)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  geom_text(aes(label = paste0(round(pct_late), "%")),
+            position = position_dodge(width = 0.7), hjust = -0.2, size = 3.4) +
+  scale_fill_manual(values = c(No = grey, Yes = orange)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Bad weather raises the share of late departures",
+       subtitle = "Share of departures 15+ minutes late, by weather in the scheduled hour",
+       x = "Late (%)", y = NULL, fill = "Condition present",
+       caption = "Source: BTS and Iowa Environmental Mesonet via nycflights23") +
+  theme(legend.position = "top")
+p_weather
+ggsave("charts/late_by_weather.png", p_weather, width = 9, height = 4.5, dpi = 150, bg = "white")
+```
+
+Delays build up through the day: 8.9% of flights scheduled at 6:00 left late, against 32.5% at 19:00. Airlines differed widely, from 12.5% late for Republic Airline to 32.3% for JetBlue, and LaGuardia (18.7%) did better than Newark (23.4%) and JFK (23.1%). Bad weather also went with more late departures: 29.5% in rain against 20.2% in dry hours, 32.6% when visibility was under 3 miles and 30.8% in winds of 20 mph or more. But bad weather is rare: only 49,499 of 406,779 flights (12%) left in rain.
+
+## 5. Separating time of day from the weather
+
+Evening flights and stormy afternoons overlap, so the simple comparisons above can mix the two up. A logistic regression estimates the effect of each factor while holding the others constant: time of day, airline, airport, month, rain, low visibility and strong wind.
+
+```{r model}
+model_data <- with_weather |>
+  mutate(period  = cut(hour, breaks = c(0, 9, 12, 15, 18, 24), right = FALSE,
+                       labels = c("5-8am", "9-11am", "12-2pm", "3-5pm", "6pm+")),
+         airline = fct_lump_min(airline, min = 5000, other_level = "Other airlines"),
+         month   = factor(month))
+
+model <- glm(late ~ period + airline + origin + month + rain + low_vis + strong_wind,
+             data = model_data, family = binomial)
+
+# Odds ratios: above 1 means more likely to leave late than the comparison group
+odds <- tidy(model) |>
+  filter(str_detect(term, "period|rain|low_vis|strong_wind|origin")) |>
+  mutate(odds_ratio = round(exp(estimate), 2),
+         ci_low     = round(exp(estimate - 1.96 * std.error), 2),
+         ci_high    = round(exp(estimate + 1.96 * std.error), 2)) |>
+  select(term, odds_ratio, ci_low, ci_high)
+odds
+```
+
+Odds ratios are hard to explain to a manager, so the next step turns the model into plain percentages: what share of all flights would leave late if every flight were scheduled in the morning, or if it rained every hour, with everything else unchanged.
+
+```{r what-if, fig.width = 9, fig.height = 4.5}
+what_if <- function(...) {
+  newdata <- mutate(model_data, ...)
+  round(100 * mean(predict(model, newdata = newdata, type = "response")), 1)
+}
+p <- function(x) factor(x, levels = levels(model_data$period))
+
+scenarios <- tribble(
+  ~factor,                       ~without,                          ~with,
+  "Scheduled 6pm+ (vs 5-8am)",   what_if(period = p("5-8am")),      what_if(period = p("6pm+")),
+  "Rain",                        what_if(rain = FALSE),             what_if(rain = TRUE),
+  "Visibility under 3 miles",    what_if(low_vis = FALSE),          what_if(low_vis = TRUE),
+  "Wind 20 mph or more",         what_if(strong_wind = FALSE),      what_if(strong_wind = TRUE)
+) |>
+  mutate(difference_pts = with - without,
+         factor = fct_reorder(factor, difference_pts))
+scenarios
+
+p_model <- ggplot(scenarios, aes(y = factor)) +
+  geom_segment(aes(x = without, xend = with, yend = factor), colour = grey, linewidth = 2) +
+  geom_point(aes(x = without), colour = navy, size = 4) +
+  geom_point(aes(x = with), colour = orange, size = 4) +
+  geom_text(aes(x = with, label = paste0(with, "%")), hjust = -0.4, size = 3.4) +
+  geom_text(aes(x = without, label = paste0(without, "%")), hjust = 1.4, size = 3.4) +
+  scale_x_continuous(limits = c(0, 40)) +
+  labs(title = "Time of day moves the late rate more than any weather condition",
+          subtitle = "Predicted late departures without (navy) and with (orange) each factor",
+       x = "Predicted late departures (%)", y = NULL,
+       caption = "Logistic regression on 406,779 NYC departures in 2023, controlling for airline, airport and month")
+p_model
+ggsave("charts/what_if.png", p_model, width = 9, height = 4.5, dpi = 150, bg = "white")
+```
+
+After holding airline, airport, month and weather constant, time of day matters most. If every flight were scheduled between 5 and 8am, the model predicts 10.4% would leave late; if every flight left at 6pm or later, 32.1% would, three times as many. Rain adds 8.7 percentage points, low visibility 7.6 and strong wind 5.6. Weather makes individual days worse, but the timetable affects every flight: delays carried forward through the day by the same aircraft and crews are the bigger, and more controllable, problem.
+
+## 6. Limitations
+
+- The data covers one year and three airports; other years or cities may differ.
+- Weather is measured at the airport in the scheduled hour. Storms elsewhere in the network, which can delay the incoming aircraft, are not included.
+- The model shows associations. The evening effect most likely comes from delays carried forward through the day, but the data does not record the cause of each delay.
+- Cancelled flights (2.5%) are left out of the late rate, so the worst disruptions are not counted as delays.
